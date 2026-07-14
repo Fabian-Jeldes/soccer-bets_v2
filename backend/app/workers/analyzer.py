@@ -1,9 +1,15 @@
 import asyncio
 import json
 import time
+import urllib.request
+import urllib.parse
 from app.database.redis_client import redis_manager
 from app.core.matcher import find_best_match
 from app.core.calculations import calculate_stakes
+from app.database.db import AsyncSessionLocal
+from app.database.models import PredictionMarketOpportunity, CrossMarketOpportunity
+from sqlalchemy import select
+from app.config import settings
 
 # Lista canonical de equipos en el sistema
 CANONICAL_TEAMS = [
@@ -223,4 +229,250 @@ class SurebetAnalyzer:
             await client.zadd(zset_key, {json.dumps(best_combination): best_roi})
             # Publicar en el canal PubSub
             await client.publish("surebets:stream", json.dumps(best_combination))
+            
+            # Alerta de Telegram si supera el ROI configurado
+            if best_roi >= settings.TELEGRAM_MIN_ROI:
+                await self._trigger_sports_telegram_alert(best_combination)
+
+        # Realizar chequeo de arbitraje cruzado (Cross-Market) si aplica
+        if market_type == "FULL_TIME" and canonical_match_home and canonical_match_away:
+            await self._check_cross_market_arbitrage(
+                match_id, league, score, minute, canonical_match_home, canonical_match_away, resolved_bookies, client
+            )
+
+    async def _check_cross_market_arbitrage(self, match_id, league, score, minute, home_team, away_team, resolved_bookies, client):
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(PredictionMarketOpportunity))
+                pred_opps = result.scalars().all()
+        except Exception as e:
+            print(f"Error consultando PredictionMarketOpportunity en DB: {e}")
+            return
+            
+        if not pred_opps:
+            return
+            
+        bookie_names = list(resolved_bookies.keys())
+        
+        for opp in pred_opps:
+            q_lower = opp.question.lower()
+            h_lower = home_team.lower()
+            a_lower = away_team.lower()
+            
+            # Buscar coincidencia difusa o substring directa de los nombres canonicales en la pregunta
+            matches_home = h_lower in q_lower
+            matches_away = a_lower in q_lower
+            
+            if not matches_home and not matches_away:
+                continue
+                
+            odds_a = opp.odds_a  # YES
+            odds_b = opp.odds_b  # NO
+            
+            # Encontrar las mejores cuotas tradicionales de FULL_TIME (1, X, 2)
+            best_o1 = 0.0
+            best_b1 = None
+            best_ox = 0.0
+            best_bx = None
+            best_o2 = 0.0
+            best_b2 = None
+            
+            for b_name in bookie_names:
+                b_odds = resolved_bookies[b_name]["odds"]
+                if len(b_odds) < 3:
+                    continue
+                if b_odds[0] > best_o1:
+                    best_o1 = b_odds[0]
+                    best_b1 = b_name
+                if b_odds[1] > best_ox:
+                    best_ox = b_odds[1]
+                    best_bx = b_name
+                if b_odds[2] > best_o2:
+                    best_o2 = b_odds[2]
+                    best_b2 = b_name
+                    
+            if not best_b1 or not best_bx or not best_b2:
+                continue
+                
+            best_roi = -99.0
+            best_combo = None
+            
+            if matches_home:
+                # Caso A: YES (Al Hilal Gana en PM) + DRAW (Bookie) + AWAY (Bookie)
+                r_a = (1.0 / odds_a) + (1.0 / best_ox) + (1.0 / best_o2)
+                if r_a < 1.0:
+                    roi_a = round(((1.0 - r_a) / r_a) * 100, 2)
+                    res_a = calculate_stakes(1000, [odds_a, best_ox, best_o2], round_to_int=True)
+                    if roi_a > best_roi:
+                        best_roi = roi_a
+                        best_combo = {
+                            "combination_type": "YES_AND_DRAW_AWAY",
+                            "sport_bookmaker": f"Draw: {best_bx}, Away: {best_b2}",
+                            "outcomes": [
+                                {"outcome": f"PM YES ({home_team})", "bookie": "Polymarket", "odds": odds_a, "stake": res_a["stakes"][0]},
+                                {"outcome": "X (Empate)", "bookie": best_bx, "odds": best_ox, "stake": res_a["stakes"][1]},
+                                {"outcome": f"2 ({away_team})", "bookie": best_b2, "odds": best_o2, "stake": res_a["stakes"][2]}
+                            ]
+                        }
+                # Caso B: NO (Al Hilal NO Gana en PM) + HOME (Bookie)
+                r_b = (1.0 / odds_b) + (1.0 / best_o1)
+                if r_b < 1.0:
+                    roi_b = round(((1.0 - r_b) / r_b) * 100, 2)
+                    res_b = calculate_stakes(1000, [odds_b, best_o1], round_to_int=True)
+                    if roi_b > best_roi:
+                        best_roi = roi_b
+                        best_combo = {
+                            "combination_type": "NO_AND_HOME",
+                            "sport_bookmaker": f"Home: {best_b1}",
+                            "outcomes": [
+                                {"outcome": f"PM NO ({home_team} NO Gana)", "bookie": "Polymarket", "odds": odds_b, "stake": res_b["stakes"][0]},
+                                {"outcome": f"1 ({home_team})", "bookie": best_b1, "odds": best_o1, "stake": res_b["stakes"][1]}
+                            ]
+                        }
+            elif matches_away:
+                # Caso A: YES (Away team Gana en PM) + HOME (Bookie) + DRAW (Bookie)
+                r_a = (1.0 / odds_a) + (1.0 / best_o1) + (1.0 / best_ox)
+                if r_a < 1.0:
+                    roi_a = round(((1.0 - r_a) / r_a) * 100, 2)
+                    res_a = calculate_stakes(1000, [odds_a, best_o1, best_ox], round_to_int=True)
+                    if roi_a > best_roi:
+                        best_roi = roi_a
+                        best_combo = {
+                            "combination_type": "YES_AND_HOME_DRAW",
+                            "sport_bookmaker": f"Home: {best_b1}, Draw: {best_bx}",
+                            "outcomes": [
+                                {"outcome": f"PM YES ({away_team})", "bookie": "Polymarket", "odds": odds_a, "stake": res_a["stakes"][0]},
+                                {"outcome": f"1 ({home_team})", "bookie": best_b1, "odds": best_o1, "stake": res_a["stakes"][1]},
+                                {"outcome": "X (Empate)", "bookie": best_bx, "odds": best_ox, "stake": res_a["stakes"][2]}
+                            ]
+                        }
+                # Caso B: NO (Away team NO Gana en PM) + AWAY (Bookie)
+                r_b = (1.0 / odds_b) + (1.0 / best_o2)
+                if r_b < 1.0:
+                    roi_b = round(((1.0 - r_b) / r_b) * 100, 2)
+                    res_b = calculate_stakes(1000, [odds_b, best_o2], round_to_int=True)
+                    if roi_b > best_roi:
+                        best_roi = roi_b
+                        best_combo = {
+                            "combination_type": "NO_AND_AWAY",
+                            "sport_bookmaker": f"Away: {best_b2}",
+                            "outcomes": [
+                                {"outcome": f"PM NO ({away_team} NO Gana)", "bookie": "Polymarket", "odds": odds_b, "stake": res_b["stakes"][0]},
+                                {"outcome": f"2 ({away_team})", "bookie": best_b2, "odds": best_o2, "stake": res_b["stakes"][1]}
+                            ]
+                        }
+
+            if best_combo and best_roi > 0:
+                cross_opt = {
+                    "sport_match_id": match_id,
+                    "prediction_market_id": opp.event_id,
+                    "teams": f"{home_team} vs {away_team}",
+                    "sport_bookmaker": best_combo["sport_bookmaker"],
+                    "prediction_question": opp.question,
+                    "combination_type": best_combo["combination_type"],
+                    "roi": best_roi,
+                    "outcomes": best_combo["outcomes"],
+                    "timestamp": time.time()
+                }
+                
+                try:
+                    async with AsyncSessionLocal() as db:
+                        # Limpiar anteriores de este match/pregunta
+                        await db.execute(
+                            CrossMarketOpportunity.__table__.delete().where(
+                                (CrossMarketOpportunity.sport_match_id == match_id) & 
+                                (CrossMarketOpportunity.prediction_market_id == opp.event_id)
+                            )
+                        )
+                        new_db_opp = CrossMarketOpportunity(
+                            sport_match_id=match_id,
+                            prediction_market_id=opp.event_id,
+                            teams=cross_opt["teams"],
+                            sport_bookmaker=cross_opt["sport_bookmaker"],
+                            prediction_question=cross_opt["prediction_question"],
+                            combination_type=cross_opt["combination_type"],
+                            roi=cross_opt["roi"],
+                            outcomes=json.dumps(cross_opt["outcomes"]),
+                            timestamp=cross_opt["timestamp"]
+                        )
+                        db.add(new_db_opp)
+                        await db.commit()
+                except Exception as e:
+                    print(f"Error escribiendo CrossMarketOpportunity en DB: {e}")
+                    
+                zset_key = "cross_surebets:active"
+                members = await client.zrange(zset_key, 0, -1)
+                for m in members:
+                    try:
+                        m_data = json.loads(m)
+                        if m_data["sport_match_id"] == match_id and m_data["prediction_market_id"] == opp.event_id:
+                            await client.zrem(zset_key, m)
+                    except Exception:
+                        pass
+                
+                await client.zadd(zset_key, {json.dumps(cross_opt): best_roi})
+                
+                # Publicar por PubSub
+                await client.publish("surebets:stream", json.dumps({
+                    "market_type": "CROSS_MARKET",
+                    **cross_opt
+                }))
+                
+                print(f"[Cross-Arb Worker] Surebet Cruzada detectada: {home_team} vs {away_team} | Combo: {best_combo['combination_type']} | ROI: +{best_roi}%")
+                
+                if best_roi >= settings.TELEGRAM_MIN_ROI:
+                    await self._trigger_cross_telegram_alert(cross_opt)
+
+    async def _trigger_sports_telegram_alert(self, combo):
+        msg = (
+            f"🔔 *SUREBET DEPORTIVA DETECTADA!*\n\n"
+            f"⚽ *Partido*: {combo['teams']}\n"
+            f"🏆 *Liga*: {combo['league']}\n"
+            f"📈 *Mercado*: {combo['market_type']}\n"
+            f"📊 *ROI*: +{combo['roi']}%\n\n"
+            f"💰 *Outcomes sugeridos*:\n"
+        )
+        for out in combo["outcomes"]:
+            msg += f"  • {out['outcome']} | Bookie: {out['bookie']} | Odds: {out['odds']} | Stake: ${out['stake']}\n"
+            
+        await self._send_telegram_msg(msg)
+
+    async def _trigger_cross_telegram_alert(self, cross_opt):
+        msg = (
+            f"🔔 *SUREBET CRUZADA DETECTADA!*\n\n"
+            f"⚽ *Partido*: {cross_opt['teams']}\n"
+            f"🔮 *Pregunta PM*: {cross_opt['prediction_question']}\n"
+            f"📈 *Combo*: {cross_opt['combination_type']}\n"
+            f"📊 *ROI*: +{cross_opt['roi']}%\n\n"
+            f"💰 *Outcomes sugeridos*:\n"
+        )
+        for out in cross_opt["outcomes"]:
+            msg += f"  • {out['outcome']} | Bookie: {out['bookie']} | Odds: {out['odds']} | Stake: ${out['stake']}\n"
+            
+        await self._send_telegram_msg(msg)
+
+    async def _send_telegram_msg(self, text: str):
+        if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+            print(f"[Telegram Notifier Simulator] Mensaje que se enviaría a Telegram:\n{text}")
+            return
+            
+        token = settings.TELEGRAM_BOT_TOKEN
+        chat_id = settings.TELEGRAM_CHAT_ID
+        
+        def do_request():
+            try:
+                url = f"https://api.telegram.org/bot{token}/sendMessage"
+                data = urllib.parse.urlencode({
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "Markdown"
+                }).encode("utf-8")
+                req = urllib.request.Request(url, data=data)
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    response.read()
+            except Exception as ex:
+                print(f"Error al enviar mensaje a Telegram: {ex}")
+                
+        await asyncio.to_thread(do_request)
+
 

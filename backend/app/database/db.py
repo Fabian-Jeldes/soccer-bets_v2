@@ -17,7 +17,7 @@ Base = declarative_base()
 async def init_db():
     async with engine.begin() as conn:
         # Importar modelos aquí para registrarlos en la metadata
-        from app.database.models import Match, SurebetOpportunity, Bet, PredictionMarketOpportunity
+        from app.database.models import Match, SurebetOpportunity, Bet, PredictionMarketOpportunity, CrossMarketOpportunity
         await conn.run_sync(Base.metadata.create_all)
 
 async def get_db():

@@ -55,5 +55,17 @@ class Bet(Base):
     settled_at = Column(Float, nullable=True)
     is_prediction = Column(Integer, default=0)  # 0 = false, 1 = true
 
+class CrossMarketOpportunity(Base):
+    __tablename__ = "cross_market_opportunities"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    sport_match_id = Column(String, nullable=False, index=True)
+    prediction_market_id = Column(String, nullable=False, index=True)
+    teams = Column(String, nullable=False)
+    sport_bookmaker = Column(String, nullable=False)
+    prediction_question = Column(String, nullable=False)
+    combination_type = Column(String, nullable=False)  # YES_AND_DRAW_AWAY, NO_AND_HOME
+    roi = Column(Float, nullable=False)
+    outcomes = Column(Text, nullable=False)  # JSON serialized string
+    timestamp = Column(Float, default=time.time)
 
-# Duplicate Bet class removed – original definition retained above

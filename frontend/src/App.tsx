@@ -46,8 +46,8 @@ export default function App() {
   const [minRoi, setMinRoi] = useState<number>(0);
   const [selectedLeague, setSelectedLeague] = useState<string>('All');
 
-  // Estados de la Fase 2 (Ledger de Apuestas y Persistencia) e Integración de Fase 3
-  const [activeTab, setActiveTab] = useState<'live' | 'two-way' | 'prediction' | 'ledger'>('live');
+  // Estados de la Fase 2 (Ledger de Apuestas y Persistencia) e Integración de Fase 3 y 4
+  const [activeTab, setActiveTab] = useState<'live' | 'two-way' | 'prediction' | 'cross' | 'ledger'>('live');
   const [bets, setBets] = useState<any[]>([]);
   const [placingBet, setPlacingBet] = useState<boolean>(false);
   const [notification, setNotification] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
@@ -65,6 +65,44 @@ export default function App() {
   // Estados de la Fase 3 (Mercados de Predicción)
   const [predictionOpps, setPredictionOpps] = useState<any[]>([]);
   const [selectedPrediction, setSelectedPrediction] = useState<any | null>(null);
+
+  // Estados de la Fase 4 (Arbitraje Cruzado y Notificaciones)
+  const [crossOpportunities, setCrossOpportunities] = useState<any[]>([]);
+  const [selectedCrossOpp, setSelectedCrossOpp] = useState<any | null>(null);
+  const notifiedRefs = useRef<Record<string, number>>({});
+
+  // Sintetizar tono de notificación interactivo (Web Audio API)
+  const playBeep = () => {
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+      osc.frequency.setValueAtTime(880, ctx.currentTime + 0.1); // A5
+      gain.gain.setValueAtTime(0.08, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.005, ctx.currentTime + 0.35);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.35);
+    } catch (e) {
+      console.warn('AudioContext alert failed to play', e);
+    }
+  };
+
+  // Disparar notificación nativa del navegador
+  const triggerBrowserNotification = (sb: any) => {
+    if (Notification.permission === 'granted') {
+      try {
+        const title = `⚽ ¡Arbitraje Detectado! (+${sb.roi}%)`;
+        const body = `${sb.teams} | Mercado: ${sb.market_type || 'CROSS_MARKET'}`;
+        new Notification(title, { body, silent: true });
+      } catch (e) {
+        console.warn('Desktop notification failed', e);
+      }
+    }
+  };
 
   const fetchBetsAndStats = async () => {
     try {
@@ -96,12 +134,35 @@ export default function App() {
     }
   };
 
+  const fetchCrossOpps = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/cross-opportunities');
+      if (res.ok) {
+        const data = await res.json();
+        setCrossOpportunities(data);
+      }
+    } catch (err) {
+      console.error('Error al obtener oportunidades cruzadas:', err);
+    }
+  };
+
+  // Solicitar permisos de notificación en el arranque de la app
+  useEffect(() => {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, []);
+
   useEffect(() => {
     fetchBetsAndStats();
     
     if (activeTab === 'prediction') {
       fetchPredictionOpps();
       const interval = setInterval(fetchPredictionOpps, 3000);
+      return () => clearInterval(interval);
+    } else if (activeTab === 'cross') {
+      fetchCrossOpps();
+      const interval = setInterval(fetchCrossOpps, 3000);
       return () => clearInterval(interval);
     }
   }, [activeTab]);
@@ -211,7 +272,7 @@ export default function App() {
 
 
   // Buffer para throttling/batching de actualizaciones en vivo
-  const updateBuffer = useRef<Surebet[]>([]);
+  const updateBuffer = useRef<any[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
 
   // Conexión WebSocket con reconexión automática
@@ -232,8 +293,20 @@ export default function App() {
         if (msg.type === 'initial_state') {
           setSurebets(msg.data);
         } else if (msg.type === 'update') {
+          const sb = msg.data;
+          // Throttling de notificaciones de alto ROI (>= 3.0%)
+          if (sb && sb.roi >= 3.0) {
+            const key = `${sb.match_id || sb.sport_match_id}_${sb.market_type || 'CROSS_MARKET'}`;
+            const now = Date.now();
+            const lastTime = notifiedRefs.current[key] || 0;
+            if (now - lastTime > 15000) {
+              notifiedRefs.current[key] = now;
+              playBeep();
+              triggerBrowserNotification(sb);
+            }
+          }
           // Agregar al buffer para aplicar batching
-          updateBuffer.current.push(msg.data);
+          updateBuffer.current.push(sb);
         }
       };
 
@@ -287,19 +360,37 @@ export default function App() {
         const batch = [...updateBuffer.current];
         updateBuffer.current = [];
 
+        // Throttling para surebets de deportes
         setSurebets((prev) => {
           const next = [...prev];
-          for (const newSb of batch) {
-            const idx = next.findIndex((item) => item.match_id === newSb.match_id);
+          const sportBatch = batch.filter(sb => sb.market_type !== 'CROSS_MARKET');
+          for (const newSb of sportBatch) {
+            const idx = next.findIndex((item) => item.match_id === newSb.match_id && item.market_type === newSb.market_type);
             if (idx > -1) {
               next[idx] = newSb;
             } else {
               next.push(newSb);
             }
           }
-          // Ordenar por ROI descendente
           return next.sort((a, b) => b.roi - a.roi);
         });
+
+        // Throttling para oportunidades cruzadas (Cross-Market)
+        const crossBatch = batch.filter(sb => sb.market_type === 'CROSS_MARKET');
+        if (crossBatch.length > 0) {
+          setCrossOpportunities((prevCross) => {
+            const nextCross = [...prevCross];
+            for (const newCross of crossBatch) {
+              const idx = nextCross.findIndex((item) => item.sport_match_id === newCross.sport_match_id && item.prediction_market_id === newCross.prediction_market_id);
+              if (idx > -1) {
+                nextCross[idx] = newCross;
+              } else {
+                nextCross.push(newCross);
+              }
+            }
+            return nextCross.sort((a, b) => b.roi - a.roi);
+          });
+        }
       }
 
       animationFrameId = requestAnimationFrame(processUpdates);
@@ -314,6 +405,7 @@ export default function App() {
     const cleanExpired = () => {
       const now = Date.now() / 1000;
       setSurebets((prev) => prev.filter((sb) => now - sb.timestamp < 8.0));
+      setCrossOpportunities((prev) => prev.filter((co) => now - co.timestamp < 8.0));
     };
 
     const interval = setInterval(cleanExpired, 2000);
@@ -424,6 +516,108 @@ export default function App() {
 
   const predCalc = getPredictionCalcResults();
 
+  // Cálculos dinámicos de la calculadora para arbitraje cruzado (Cross-Market)
+  const getCrossCalcResults = () => {
+    if (!selectedCrossOpp) return null;
+    const odds = selectedCrossOpp.outcomes.map((o: any) => o.odds);
+    const sumInvOdds = odds.reduce((acc: number, o: number) => acc + 1 / o, 0);
+
+    // Stakes crudos
+    const rawStakes = odds.map((o: number) => (budget * (1 / o)) / sumInvOdds);
+    // Redondear a enteros
+    const roundedStakes = rawStakes.map((s: number) => Math.max(1, Math.round(s)));
+    const totalSpent = roundedStakes.reduce((acc: number, s: number) => acc + s, 0);
+
+    // Retornos y ganancias
+    const returns = roundedStakes.map((s: number, i: number) => Math.round(s * odds[i] * 100) / 100);
+    const minReturn = Math.min(...returns);
+    const profit = Math.round((minReturn - totalSpent) * 100) / 100;
+    const roi = Math.round((profit / totalSpent) * 10000) / 100;
+
+    return {
+      stakes: roundedStakes,
+      returns,
+      totalSpent,
+      profit,
+      roi,
+      hasArbitrage: profit > 0,
+      arbPercentage: Math.round(sumInvOdds * 10000) / 100
+    };
+  };
+
+  const crossCalc = getCrossCalcResults();
+
+  // Registrar apuesta cruzada en el ledger
+  const handleRegisterCrossBet = async () => {
+    if (!selectedCrossOpp || !crossCalc) return;
+    setPlacingBet(true);
+    try {
+      const outcomes = selectedCrossOpp.outcomes.map((out: any, idx: number) => ({
+        outcome: out.outcome,
+        bookie: out.bookie,
+        odds: out.odds,
+        stake: crossCalc.stakes[idx]
+      }));
+
+      const res = await fetch('http://localhost:8000/api/cross-bets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sport_match_id: selectedCrossOpp.sport_match_id,
+          prediction_market_id: selectedCrossOpp.prediction_market_id,
+          teams: selectedCrossOpp.teams,
+          outcomes,
+          total_spent: crossCalc.totalSpent,
+          expected_profit: crossCalc.profit
+        })
+      });
+
+      if (res.ok) {
+        setNotification({ message: '¡Apuesta cruzada registrada exitosamente!', type: 'success' });
+        fetchBetsAndStats();
+        setSelectedCrossOpp(null);
+        setTimeout(() => setNotification(null), 4000);
+      } else {
+        setNotification({ message: 'Error al registrar la apuesta cruzada.', type: 'error' });
+        setTimeout(() => setNotification(null), 4000);
+      }
+    } catch (err) {
+      setNotification({ message: 'Error de red al conectar con el servidor.', type: 'error' });
+      setTimeout(() => setNotification(null), 4000);
+    } finally {
+      setPlacingBet(false);
+    }
+  };
+
+  // Generar puntos para el gráfico SVG de evolución del capital
+  const getChartData = () => {
+    const settledBets = bets
+      .filter((b) => b.status === 'WON' || b.status === 'LOST' || b.status === 'REFUNDED')
+      .sort((a, b) => a.placed_at - b.placed_at);
+      
+    let cumulative = 0;
+    const chartPoints = [{ x: 0, y: 0, date: 'Inicio' }];
+    
+    settledBets.forEach((bet, index) => {
+      let profit = 0;
+      if (bet.status === 'WON') {
+        profit = (bet.actual_return || (bet.total_spent + bet.expected_profit)) - bet.total_spent;
+      } else if (bet.status === 'LOST') {
+        profit = -bet.total_spent;
+      }
+      cumulative += profit;
+      
+      const dateStr = new Date(bet.placed_at * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + new Date(bet.placed_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      chartPoints.push({
+        x: index + 1,
+        y: Number(cumulative.toFixed(2)),
+        date: dateStr
+      });
+    });
+    
+    return chartPoints;
+  };
+
   // Métricas rápidas para el dashboard
   const avgRoi = surebets.length > 0 
     ? (surebets.reduce((acc, sb) => acc + sb.roi, 0) / surebets.length).toFixed(2)
@@ -463,6 +657,13 @@ export default function App() {
           >
             <Coins size={16} />
             <span>Predicción</span>
+          </button>
+          <button 
+            className={`tab-btn ${activeTab === 'cross' ? 'active' : ''}`}
+            onClick={() => { setActiveTab('cross'); setSelectedCrossOpp(null); }}
+          >
+            <TrendingUp size={16} />
+            <span>Arbitraje Cruzado</span>
           </button>
           <button 
             className={`tab-btn ${activeTab === 'ledger' ? 'active' : ''}`}
@@ -885,8 +1086,264 @@ export default function App() {
               )}
             </div>
           </>
+        ) : activeTab === 'cross' ? (
+          <>
+            {/* Left Side: Cross-Market Opportunities List */}
+            <div className="dashboard-left">
+              {/* Metrics */}
+              <div className="metrics-grid">
+                <div className="metric-card">
+                  <span className="metric-label">Surebets Cruzadas</span>
+                  <span className="metric-value">{crossOpportunities.length}</span>
+                </div>
+                <div className="metric-card teal">
+                  <span className="metric-label">ROI Promedio</span>
+                  <span className="metric-value">
+                    {(crossOpportunities.reduce((acc, o) => acc + o.roi, 0) / (crossOpportunities.length || 1)).toFixed(2)}%
+                  </span>
+                </div>
+                <div className="metric-card">
+                  <span className="metric-label">ROI Máximo Activo</span>
+                  <span className="metric-value">
+                    {(crossOpportunities.length > 0 ? Math.max(...crossOpportunities.map(o => o.roi)) : 0.00).toFixed(2)}%
+                  </span>
+                </div>
+              </div>
+
+              {/* List Section */}
+              <div>
+                <div className="list-section-header">
+                  <h2>Oportunidades de Arbitraje Cruzado (Cross-Market)</h2>
+                  <span className="text-secondary" style={{ fontSize: '0.9rem' }}>
+                    Surebets combinando contratos de predicción Yes/No con cuotas tradicionales de partidos de fútbol.
+                  </span>
+                </div>
+
+                {crossOpportunities.length === 0 ? (
+                  <div className="empty-state">
+                    <AlertCircle className="empty-icon" size={48} />
+                    <div>
+                      <p style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: '0.25rem' }}>No hay surebets cruzadas activas</p>
+                      <p style={{ fontSize: '0.85rem' }}>Buscando coincidencias entre cuotas tradicionales y contratos de Polymarket...</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="surebets-container">
+                    {crossOpportunities.map((opp) => (
+                      <div 
+                        key={opp.id}
+                        className={`surebet-card cross-card ${selectedCrossOpp?.id === opp.id ? 'selected' : ''}`}
+                        onClick={() => setSelectedCrossOpp(opp)}
+                      >
+                        <div className="card-top">
+                          <span className="league-badge" style={{ backgroundColor: 'rgba(139, 92, 246, 0.15)', color: '#8b5cf6', border: '1px solid rgba(139, 92, 246, 0.3)' }}>Cross-Market</span>
+                          <span className="roi-badge">+{opp.roi}% ROI</span>
+                        </div>
+
+                        <div className="card-teams" style={{ fontSize: '1rem', fontWeight: 600, margin: '0.5rem 0' }}>
+                          {opp.teams}
+                        </div>
+                        
+                        <div className="card-question" style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
+                          🔮 {opp.prediction_question}
+                        </div>
+
+                        <div className="card-outcomes">
+                          {opp.outcomes.map((out: any, idx: number) => (
+                            <div key={idx} className="outcome-pill">
+                              <span className="outcome-label">{out.outcome}</span>
+                              <span className="outcome-bookie">{out.bookie.replace('Bookie_', '').replace('_', ' ')}</span>
+                              <span className="outcome-odds">@{out.odds.toFixed(2)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Right Side: Cross-Market Calculator */}
+            <div className="sidebar-panel">
+              <div className="panel-header">
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#8b5cf6' }}>
+                  <Calculator size={20} />
+                  <span className="panel-title">Calculadora Cruzada</span>
+                </div>
+                <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                  Stakes óptimos para cubrir todos los escenarios entre Polymarket y casas tradicionales.
+                </p>
+              </div>
+
+              {!selectedCrossOpp ? (
+                <div className="no-selection">
+                  <BookOpen size={40} />
+                  <p>Selecciona una surebet cruzada de la lista para calcular los stakes óptimos en cada extremo.</p>
+                </div>
+              ) : (
+                <div className="calculator-body">
+                  <div>
+                    <p style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: '0.25rem' }}>{selectedCrossOpp.teams}</p>
+                    <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                      {selectedCrossOpp.prediction_question}
+                    </p>
+                  </div>
+
+                  {/* Budget Input */}
+                  <div className="input-container">
+                    <div className="input-label-row">
+                      <span>Presupuesto Total (Inversión)</span>
+                      <span>USD</span>
+                    </div>
+                    <div className="budget-input-wrapper">
+                      <span className="currency-symbol">$</span>
+                      <input 
+                        type="number" 
+                        className="budget-input"
+                        value={budget}
+                        onChange={(e) => setBudget(Math.max(10, parseFloat(e.target.value) || 0))}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Stake Distribution */}
+                  <div className="calc-distribution">
+                    <p className="filter-label">Distribución de Stakes Sugeridos</p>
+                    {selectedCrossOpp.outcomes.map((out: any, idx: number) => (
+                      <div key={idx} className="dist-row">
+                        <div className="dist-left">
+                          <span className="dist-outcome">{out.outcome}</span>
+                          <span className="dist-sub">{out.bookie.replace('Bookie_', '').replace('_', ' ')} (Cuota {out.odds.toFixed(2)})</span>
+                        </div>
+                        <div className="dist-right">
+                          <span className="dist-stake">${crossCalc?.stakes[idx]}</span>
+                          <span className="dist-return">Retorno: ${crossCalc?.returns[idx]}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Profit Summary */}
+                  <div className="calc-summary">
+                    <div className="summary-row total-spent">
+                      <span>Inversión Real:</span>
+                      <span>${crossCalc?.totalSpent}</span>
+                    </div>
+                    <div className="summary-row total-spent">
+                      <span>Porcentaje de Arbitraje (Arb %):</span>
+                      <span>{crossCalc?.arbPercentage}%</span>
+                    </div>
+                    <div className="summary-row profit">
+                      <span>Retorno Neto Seguro:</span>
+                      <span>+${crossCalc?.profit} ({crossCalc?.roi}%)</span>
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '0.5rem', padding: '0.5rem', backgroundColor: 'rgba(139, 92, 246, 0.05)', border: '1px solid rgba(139, 92, 246, 0.15)', borderRadius: '8px', fontSize: '0.75rem', color: '#8b5cf6' }}>
+                    <ShieldCheck size={28} style={{ flexShrink: 0, marginTop: '2px' }} />
+                    <span>
+                      Esta apuesta combina la seguridad del contrato de Polymarket con las cuotas máximas de casas de apuestas tradicionales.
+                    </span>
+                  </div>
+
+                  {/* Register Bet Button */}
+                  <button 
+                    className="register-bet-btn"
+                    disabled={placingBet}
+                    onClick={handleRegisterCrossBet}
+                    style={{ backgroundColor: '#8b5cf6', borderColor: '#8b5cf6' }}
+                  >
+                    {placingBet ? 'Registrando...' : 'Registrar Apuesta en Ledger'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </>
         ) : (
           <div className="ledger-view">
+            {/* SVG Chart of Cumulative Profit */}
+            {bets.filter((b) => b.status === 'WON' || b.status === 'LOST').length > 0 && (
+              <div className="ledger-table-container" style={{ marginBottom: '1.5rem', padding: '1.25rem' }}>
+                <h3 style={{ fontSize: '1rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '1rem' }}>
+                  Evolución Histórica del Capital (Ganancia Neta Acumulada)
+                </h3>
+                <div style={{ display: 'flex', justifyContent: 'center', width: '100%' }}>
+                  {(() => {
+                    const chartData = getChartData();
+                    if (chartData.length < 2) return <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Registra más apuestas finalizadas para visualizar tu curva de crecimiento.</p>;
+                    
+                    const width = 600;
+                    const height = 180;
+                    const padding = 30;
+                    
+                    const maxX = chartData.length - 1;
+                    
+                    const yValues = chartData.map((d) => d.y);
+                    const minY = Math.min(...yValues) < 0 ? Math.min(...yValues) * 1.15 : 0;
+                    const maxY = Math.max(...yValues) > 0 ? Math.max(...yValues) * 1.15 : 10;
+                    
+                    // Generate points string for line
+                    const points = chartData.map((d, i) => {
+                      const sx = padding + (i / maxX) * (width - 2 * padding);
+                      const sy = height - padding - ((d.y - minY) / (maxY - minY)) * (height - 2 * padding);
+                      return `${sx},${sy}`;
+                    }).join(' ');
+                    
+                    // Generate path string for gradient area
+                    const areaPoints = [
+                      `${padding},${height - padding}`, // start bottom left
+                      ...chartData.map((d, i) => {
+                        const sx = padding + (i / maxX) * (width - 2 * padding);
+                        const sy = height - padding - ((d.y - minY) / (maxY - minY)) * (height - 2 * padding);
+                        return `${sx},${sy}`;
+                      }),
+                      `${width - padding},${height - padding}` // end bottom right
+                    ].join(' ');
+
+                    return (
+                      <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} style={{ overflow: 'visible' }}>
+                        <defs>
+                          <linearGradient id="chart-grad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="var(--accent-teal)" stopOpacity="0.25" />
+                            <stop offset="100%" stopColor="var(--accent-teal)" stopOpacity="0.00" />
+                          </linearGradient>
+                        </defs>
+                        {/* Grid lines */}
+                        <line x1={padding} y1={padding} x2={width - padding} y2={padding} stroke="rgba(255,255,255,0.05)" />
+                        <line x1={padding} y1={height / 2} x2={width - padding} y2={height / 2} stroke="rgba(255,255,255,0.05)" />
+                        <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="rgba(255,255,255,0.15)" strokeWidth="1" />
+                        
+                        {/* Area fill */}
+                        <polygon points={areaPoints} fill="url(#chart-grad)" />
+                        
+                        {/* Line path */}
+                        <polyline points={points} fill="none" stroke="var(--accent-teal)" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round" />
+                        
+                        {/* Points and Tooltips */}
+                        {chartData.map((pt, i) => {
+                          const sx = padding + (i / maxX) * (width - 2 * padding);
+                          const sy = height - padding - ((pt.y - minY) / (maxY - minY)) * (height - 2 * padding);
+                          return (
+                            <g key={i} className="chart-dot-group">
+                              <circle cx={sx} cy={sy} r="4.5" fill="#1e293b" stroke="var(--accent-teal)" strokeWidth="2.5" />
+                              <title>{`${pt.date}\nCapital: $${pt.y}`}</title>
+                            </g>
+                          );
+                        })}
+                        {/* Y-axis Labels */}
+                        <text x={padding - 8} y={padding + 4} fill="var(--text-secondary)" fontSize="10" textAnchor="end">${maxY.toFixed(0)}</text>
+                        <text x={padding - 8} y={height - padding + 4} fill="var(--text-secondary)" fontSize="10" textAnchor="end">${minY.toFixed(0)}</text>
+                        {/* X-axis Labels */}
+                        <text x={padding} y={height - 8} fill="var(--text-secondary)" fontSize="10" textAnchor="middle">Inicio</text>
+                        <text x={width - padding} y={height - 8} fill="var(--text-secondary)" fontSize="10" textAnchor="middle">Actual</text>
+                      </svg>
+                    );
+                  })()}
+                </div>
+              </div>
+            )}
+
             {/* Stats Cards */}
             <div className="metrics-grid stats-grid">
               <div className="metric-card">
@@ -956,6 +1413,8 @@ export default function App() {
                               <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center', marginTop: '0.25rem' }}>
                                 {bet.is_prediction === 1 ? (
                                   <span className="league-badge" style={{ backgroundColor: 'rgba(59, 130, 246, 0.15)', color: '#3b82f6', border: '1px solid rgba(59, 130, 246, 0.3)', padding: '0.05rem 0.3rem', fontSize: '0.65rem', borderRadius: '4px' }}>Predicción</span>
+                                ) : bet.is_prediction === 2 ? (
+                                  <span className="league-badge" style={{ backgroundColor: 'rgba(139, 92, 246, 0.15)', color: '#8b5cf6', border: '1px solid rgba(139, 92, 246, 0.3)', padding: '0.05rem 0.3rem', fontSize: '0.65rem', borderRadius: '4px' }}>Cruzado</span>
                                 ) : (
                                   <>
                                     <span className="league-badge" style={{ padding: '0.05rem 0.3rem', fontSize: '0.65rem', borderRadius: '4px' }}>Deporte</span>

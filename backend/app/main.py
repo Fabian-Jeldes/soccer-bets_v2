@@ -10,7 +10,7 @@ from app.scraper.simulator import InPlaySimulator
 from app.workers.analyzer import SurebetAnalyzer
 from app.scraper.polymarket import PolymarketScraper
 from app.database.db import init_db, get_db
-from app.database.models import Bet, PredictionMarketOpportunity
+from app.database.models import Bet, PredictionMarketOpportunity, CrossMarketOpportunity
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from pydantic import BaseModel
@@ -350,4 +350,70 @@ async def create_prediction_bet(bet_data: PredictionBetCreateInput, db: AsyncSes
         "is_prediction": db_bet.is_prediction,
         "placed_at": db_bet.placed_at
     }
+
+@app.get("/api/cross-opportunities")
+async def get_cross_opportunities(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(CrossMarketOpportunity).order_by(CrossMarketOpportunity.roi.desc()))
+    opportunities = result.scalars().all()
+    return [
+        {
+            "id": opp.id,
+            "sport_match_id": opp.sport_match_id,
+            "prediction_market_id": opp.prediction_market_id,
+            "teams": opp.teams,
+            "sport_bookmaker": opp.sport_bookmaker,
+            "prediction_question": opp.prediction_question,
+            "combination_type": opp.combination_type,
+            "roi": opp.roi,
+            "outcomes": json.loads(opp.outcomes) if opp.outcomes else [],
+            "timestamp": opp.timestamp
+        }
+        for opp in opportunities
+    ]
+
+class CrossBetOutcomeInput(BaseModel):
+    outcome: str
+    bookie: str
+    odds: float
+    stake: float
+
+class CrossBetCreateInput(BaseModel):
+    sport_match_id: str
+    prediction_market_id: str
+    teams: str
+    outcomes: list[CrossBetOutcomeInput]
+    total_spent: float
+    expected_profit: float
+
+@app.post("/api/cross-bets")
+async def create_cross_bet(bet_data: CrossBetCreateInput, db: AsyncSession = Depends(get_db)):
+    outcomes_list = [out.model_dump() for out in bet_data.outcomes]
+    outcomes_json = json.dumps(outcomes_list)
+    db_bet = Bet(
+        match_id=f"{bet_data.sport_match_id}_{bet_data.prediction_market_id}",
+        teams=bet_data.teams,
+        league="Cross-Market",
+        outcomes=outcomes_json,
+        total_spent=bet_data.total_spent,
+        expected_profit=bet_data.expected_profit,
+        status="PENDING",
+        is_prediction=2,  # 2 = Cross-Market Bet
+        placed_at=time.time()
+    )
+    db.add(db_bet)
+    await db.commit()
+    await db.refresh(db_bet)
+    return {
+        "id": db_bet.id,
+        "match_id": db_bet.match_id,
+        "teams": db_bet.teams,
+        "league": db_bet.league,
+        "outcomes": outcomes_list,
+        "total_spent": db_bet.total_spent,
+        "expected_profit": db_bet.expected_profit,
+        "status": db_bet.status,
+        "is_prediction": db_bet.is_prediction,
+        "placed_at": db_bet.placed_at
+    }
+
 
