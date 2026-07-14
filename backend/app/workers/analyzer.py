@@ -7,7 +7,7 @@ from app.database.redis_client import redis_manager
 from app.core.matcher import find_best_match
 from app.core.calculations import calculate_stakes
 from app.database.db import AsyncSessionLocal
-from app.database.models import PredictionMarketOpportunity, CrossMarketOpportunity
+from app.database.models import PredictionMarketOpportunity, CrossMarketOpportunity, SurebetOpportunity
 from sqlalchemy import select
 from app.config import settings
 
@@ -229,6 +229,23 @@ class SurebetAnalyzer:
             await client.zadd(zset_key, {json.dumps(best_combination): best_roi})
             # Publicar en el canal PubSub
             await client.publish("surebets:stream", json.dumps(best_combination))
+            
+            # Guardar en base de datos la oportunidad de surebet para el historial persistente
+            try:
+                async with AsyncSessionLocal() as db:
+                    new_db_opp = SurebetOpportunity(
+                        match_id=match_id,
+                        market_type=market_type,
+                        roi=best_roi,
+                        profit=best_combination["profit"],
+                        total_spent=best_combination["total_spent"],
+                        outcomes=json.dumps(best_combination["outcomes"]),
+                        timestamp=time.time()
+                    )
+                    db.add(new_db_opp)
+                    await db.commit()
+            except Exception as e:
+                print(f"Error escribiendo SurebetOpportunity en DB: {e}")
             
             # Alerta de Telegram si supera el ROI configurado
             if best_roi >= settings.TELEGRAM_MIN_ROI:
@@ -453,7 +470,13 @@ class SurebetAnalyzer:
 
     async def _send_telegram_msg(self, text: str):
         if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
-            print(f"[Telegram Notifier Simulator] Mensaje que se enviaría a Telegram:\n{text}")
+            try:
+                print(f"[Telegram Notifier Simulator] Mensaje que se enviaría a Telegram:\n{text}")
+            except UnicodeEncodeError:
+                import sys
+                encoding = sys.stdout.encoding or 'ascii'
+                safe_text = text.encode(encoding, errors='replace').decode(encoding)
+                print(f"[Telegram Notifier Simulator] Mensaje que se enviaría a Telegram (Safe):\n{safe_text}")
             return
             
         token = settings.TELEGRAM_BOT_TOKEN

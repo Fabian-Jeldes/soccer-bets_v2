@@ -10,7 +10,7 @@ from app.scraper.simulator import InPlaySimulator
 from app.workers.analyzer import SurebetAnalyzer
 from app.scraper.polymarket import PolymarketScraper
 from app.database.db import init_db, get_db
-from app.database.models import Bet, PredictionMarketOpportunity, CrossMarketOpportunity
+from app.database.models import Match, SurebetOpportunity, Bet, PredictionMarketOpportunity, CrossMarketOpportunity
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from pydantic import BaseModel
@@ -29,6 +29,10 @@ async def lifespan(app: FastAPI):
     # Inicializar Base de Datos
     await init_db()
     print("Base de Datos inicializada.")
+    
+    # Sembrar Base de Datos si está vacía
+    from app.database.seed import seed_db_if_empty
+    await seed_db_if_empty()
     
     # Iniciar simulador de cuotas
     await simulator.start()
@@ -93,6 +97,142 @@ async def get_active_surebets():
         except json.JSONDecodeError:
             pass
     return surebets
+
+# Endpoint para obtener sugerencias/predicciones basadas en el historial H2H
+@app.get("/api/suggestions")
+async def get_suggestions(db: AsyncSession = Depends(get_db)):
+    result_scheduled = await db.execute(
+        select(Match).where(Match.status == "SCHEDULED").order_by(Match.start_time.asc())
+    )
+    scheduled_matches = result_scheduled.scalars().all()
+    
+    suggestions = []
+    for match in scheduled_matches:
+        home = match.home_team
+        away = match.away_team
+        
+        # Buscar partidos históricos finalizados para estos dos equipos (H2H)
+        stmt_h2h = select(Match).where(
+            (Match.status == "FINISHED") & 
+            (
+                ((Match.home_team == home) & (Match.away_team == away)) |
+                ((Match.home_team == away) & (Match.away_team == home))
+            )
+        )
+        res_h2h = await db.execute(stmt_h2h)
+        h2h_matches = res_h2h.scalars().all()
+        
+        n_matches = len(h2h_matches)
+        h_wins = 0
+        a_wins = 0
+        draws = 0
+        total_goals = 0
+        over_2_5 = 0
+        
+        for hm in h2h_matches:
+            try:
+                sh, sa = map(int, hm.score.split("-"))
+            except Exception:
+                sh, sa = 0, 0
+                
+            total_goals += (sh + sa)
+            if (sh + sa) > 2.5:
+                over_2_5 += 1
+                
+            if hm.home_team == home:
+                if sh > sa:
+                    h_wins += 1
+                elif sa > sh:
+                    a_wins += 1
+                else:
+                    draws += 1
+            else:  # hm.home_team == away (invertido)
+                if sa > sh:
+                    h_wins += 1
+                elif sh > sa:
+                    a_wins += 1
+                else:
+                    draws += 1
+                    
+        if n_matches > 0:
+            pct_home = (h_wins / n_matches) * 100
+            pct_away = (a_wins / n_matches) * 100
+            pct_draw = (draws / n_matches) * 100
+            pct_over = (over_2_5 / n_matches) * 100
+            avg_goals = round(total_goals / n_matches, 2)
+            
+            # Sugerencia Ganador
+            if h_wins > a_wins and pct_home >= 45:
+                sug_winner = f"Ganador: {home}"
+                win_confidence = round(pct_home, 1)
+            elif a_wins > h_wins and pct_away >= 45:
+                sug_winner = f"Ganador: {away}"
+                win_confidence = round(pct_away, 1)
+            elif pct_draw >= 35:
+                sug_winner = "Empate"
+                win_confidence = round(pct_draw, 1)
+            else:
+                sug_winner = f"Doble Op.: {home} o Empate"
+                win_confidence = round(pct_home + pct_draw, 1)
+                
+            # Sugerencia Goles
+            if pct_over >= 50:
+                sug_goals = "Over 2.5 Goles"
+                goals_confidence = round(pct_over, 1)
+            else:
+                sug_goals = "Under 2.5 Goles"
+                goals_confidence = round(100 - pct_over, 1)
+        else:
+            pct_home = pct_away = pct_draw = pct_over = 0
+            avg_goals = 0.0
+            sug_winner = "Doble Op.: Local/Visitante"
+            win_confidence = 50.0
+            sug_goals = "Under 2.5 Goles"
+            goals_confidence = 50.0
+            
+        suggestions.append({
+            "match_id": match.id,
+            "league": match.league,
+            "home_team": home,
+            "away_team": away,
+            "start_time": match.start_time,
+            "h2h_stats": {
+                "total_matches": n_matches,
+                "home_wins": h_wins,
+                "away_wins": a_wins,
+                "draws": draws,
+                "avg_goals": avg_goals,
+                "over_2_5_pct": round(pct_over, 1)
+            },
+            "suggestions": {
+                "winner": sug_winner,
+                "winner_confidence": win_confidence,
+                "goals": sug_goals,
+                "goals_confidence": goals_confidence
+            }
+        })
+        
+    return suggestions
+
+# Endpoint para listar historial reciente de oportunidades de surebet
+@app.get("/api/surebets/history")
+async def get_surebets_history(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(SurebetOpportunity).order_by(SurebetOpportunity.timestamp.desc()).limit(30))
+    opps = result.scalars().all()
+    
+    return [
+        {
+            "id": opp.id,
+            "match_id": opp.match_id,
+            "market_type": opp.market_type,
+            "roi": opp.roi,
+            "profit": opp.profit,
+            "total_spent": opp.total_spent,
+            "outcomes": json.loads(opp.outcomes) if opp.outcomes else [],
+            "timestamp": opp.timestamp
+        }
+        for opp in opps
+    ]
 
 # WebSocket para recibir actualizaciones en vivo de surebets
 @app.websocket("/ws/surebets")

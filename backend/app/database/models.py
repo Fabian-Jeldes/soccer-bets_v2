@@ -11,7 +11,8 @@ class Match(Base):
     away_team = Column(String, nullable=False)
     score = Column(String, default="0-0")
     minute = Column(Integer, default=0)
-    status = Column(String, default="IN_PLAY")  # IN_PLAY, FINISHED
+    status = Column(String, default="IN_PLAY")  # IN_PLAY, FINISHED, SCHEDULED
+    start_time = Column(Float, nullable=True)     # Unix timestamp representing match start time
     created_at = Column(Float, default=time.time)
     updated_at = Column(Float, default=time.time)
 

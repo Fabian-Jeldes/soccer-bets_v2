@@ -47,8 +47,29 @@ export default function App() {
   const [selectedLeague, setSelectedLeague] = useState<string>('All');
 
   // Estados de la Fase 2 (Ledger de Apuestas y Persistencia) e Integración de Fase 3 y 4
-  const [activeTab, setActiveTab] = useState<'live' | 'two-way' | 'prediction' | 'cross' | 'ledger'>('live');
+  const [activeTab, setActiveTab] = useState<'live' | 'two-way' | 'prediction' | 'cross' | 'ledger' | 'suggestions'>('live');
   const [bets, setBets] = useState<any[]>([]);
+  
+  // Estados para Congelar Feed, Sugerencias e Historial
+  const [freezeFeed, setFreezeFeed] = useState<boolean>(false);
+  const freezeFeedRef = useRef<boolean>(false);
+  useEffect(() => {
+    freezeFeedRef.current = freezeFeed;
+  }, [freezeFeed]);
+
+  const [suggestions, setSuggestions] = useState<any[]>([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState<boolean>(false);
+  const [surebetsHistory, setSurebetsHistory] = useState<any[]>([]);
+
+  const getTeamsFromMatchId = (matchId: string) => {
+    const m = matchId.toLowerCase();
+    if (m.includes("match_1") || m.includes("mc_alger")) return "MC Alger vs CR Belouizdad";
+    if (m.includes("match_2") || m.includes("gor_mahia")) return "Gor Mahia vs Tusker FC";
+    if (m.includes("match_3") || m.includes("al_ahly") || m.includes("al_hy")) return "Al Ahly vs Zamalek SC";
+    if (m.includes("match_4") || m.includes("al_hilal")) return "Al Hilal vs Al Nassr";
+    if (m.includes("match_5") || m.includes("mamelodi")) return "Mamelodi Sundowns vs Orlando Pirates";
+    return "Partido Deportivo";
+  };
   const [placingBet, setPlacingBet] = useState<boolean>(false);
   const [notification, setNotification] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [stats, setStats] = useState<any>({
@@ -146,6 +167,33 @@ export default function App() {
     }
   };
 
+  const fetchSuggestions = async () => {
+    setLoadingSuggestions(true);
+    try {
+      const res = await fetch('http://localhost:8000/api/suggestions');
+      if (res.ok) {
+        const data = await res.json();
+        setSuggestions(data);
+      }
+    } catch (err) {
+      console.error('Error al obtener sugerencias H2H:', err);
+    } finally {
+      setLoadingSuggestions(false);
+    }
+  };
+
+  const fetchSurebetsHistory = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/surebets/history');
+      if (res.ok) {
+        const data = await res.json();
+        setSurebetsHistory(data);
+      }
+    } catch (err) {
+      console.error('Error al obtener historial de surebets:', err);
+    }
+  };
+
   // Solicitar permisos de notificación en el arranque de la app
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
@@ -163,6 +211,14 @@ export default function App() {
     } else if (activeTab === 'cross') {
       fetchCrossOpps();
       const interval = setInterval(fetchCrossOpps, 3000);
+      return () => clearInterval(interval);
+    } else if (activeTab === 'suggestions') {
+      fetchSuggestions();
+      const interval = setInterval(fetchSuggestions, 8000);
+      return () => clearInterval(interval);
+    } else if (activeTab === 'live' || activeTab === 'two-way') {
+      fetchSurebetsHistory();
+      const interval = setInterval(fetchSurebetsHistory, 5000);
       return () => clearInterval(interval);
     }
   }, [activeTab]);
@@ -293,6 +349,7 @@ export default function App() {
         if (msg.type === 'initial_state') {
           setSurebets(msg.data);
         } else if (msg.type === 'update') {
+          if (freezeFeedRef.current) return;
           const sb = msg.data;
           // Throttling de notificaciones de alto ROI (>= 3.0%)
           if (sb && sb.roi >= 3.0) {
@@ -335,7 +392,7 @@ export default function App() {
     const fetchActiveSurebets = async () => {
       try {
         const res = await fetch('http://localhost:8000/api/surebets');
-        if (res.ok) {
+        if (res.ok && !freezeFeedRef.current) {
           const data = await res.json();
           setSurebets(data);
         }
@@ -356,6 +413,11 @@ export default function App() {
     let animationFrameId: number;
 
     const processUpdates = () => {
+      if (freezeFeedRef.current) {
+        updateBuffer.current = [];
+        animationFrameId = requestAnimationFrame(processUpdates);
+        return;
+      }
       if (updateBuffer.current.length > 0) {
         const batch = [...updateBuffer.current];
         updateBuffer.current = [];
@@ -403,6 +465,7 @@ export default function App() {
   // Limpieza automática local de surebets inactivas (más de 8 segundos sin actualizar)
   useEffect(() => {
     const cleanExpired = () => {
+      if (freezeFeedRef.current) return;
       const now = Date.now() / 1000;
       setSurebets((prev) => prev.filter((sb) => now - sb.timestamp < 8.0));
       setCrossOpportunities((prev) => prev.filter((co) => now - co.timestamp < 8.0));
@@ -429,15 +492,13 @@ export default function App() {
     return matchLeague && matchRoi && matchTabType;
   });
 
-  // Si la surebet seleccionada ya no está activa, deseleccionarla
+  // Si la surebet seleccionada ya no está activa, mantener sus datos pero no deseleccionarla
   useEffect(() => {
     if (selectedSurebet) {
       const active = surebets.find((sb) => sb.match_id === selectedSurebet.match_id && sb.market_type === selectedSurebet.market_type);
       if (active) {
         // Actualizar datos dinámicos en vivo en la calculadora
         setSelectedSurebet(active);
-      } else {
-        setSelectedSurebet(null);
       }
     }
   }, [surebets]);
@@ -666,6 +727,13 @@ export default function App() {
             <span>Arbitraje Cruzado</span>
           </button>
           <button 
+            className={`tab-btn ${activeTab === 'suggestions' ? 'active' : ''}`}
+            onClick={() => { setActiveTab('suggestions'); }}
+          >
+            <BookOpen size={16} />
+            <span>Sugerencias</span>
+          </button>
+          <button 
             className={`tab-btn ${activeTab === 'ledger' ? 'active' : ''}`}
             onClick={() => setActiveTab('ledger')}
           >
@@ -689,7 +757,7 @@ export default function App() {
       )}
 
       {/* Main Grid */}
-      <main style={{ gridTemplateColumns: activeTab === 'ledger' ? '1fr' : undefined }}>
+      <main style={{ gridTemplateColumns: (activeTab === 'ledger' || activeTab === 'suggestions') ? '1fr' : undefined }}>
         {(activeTab === 'live' || activeTab === 'two-way') ? (
           <>
             {/* Left Side: Stats, Filters and Surebet List */}
@@ -737,10 +805,14 @@ export default function App() {
                   />
                 </div>
                 
-                <div style={{ marginLeft: 'auto', display: 'flex', gap: '0.5rem', color: 'var(--text-secondary)', fontSize: '0.8rem' }}>
+                <button 
+                  className={`freeze-btn ${freezeFeed ? 'active' : ''}`}
+                  onClick={() => setFreezeFeed(!freezeFeed)}
+                  style={{ marginLeft: 'auto' }}
+                >
                   <Clock size={16} />
-                  <span>Actualizaciones en tiempo real activas (latencia sub-200ms)</span>
-                </div>
+                  <span>{freezeFeed ? '❄️ Feed Congelado' : '⏳ Congelar Feed'}</span>
+                </button>
               </div>
 
               {/* List Section */}
@@ -807,6 +879,46 @@ export default function App() {
                   </div>
                 )}
               </div>
+
+              {/* Recent Surebets History */}
+              <div className="recent-surebets-section">
+                <h3 className="recent-surebets-title">
+                  <History size={18} />
+                  <span>Historial Reciente de Arbitrajes (Persistido)</span>
+                </h3>
+                
+                {surebetsHistory.length === 0 ? (
+                  <div className="empty-state" style={{ padding: '1.5rem' }}>
+                    <AlertCircle className="empty-icon" size={24} />
+                    <p style={{ fontSize: '0.85rem' }}>No hay oportunidades en el historial aún...</p>
+                  </div>
+                ) : (
+                  <div className="surebets-container" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '0.75rem' }}>
+                    {surebetsHistory.map((sb) => {
+                      const isSelected = selectedSurebet?.match_id === sb.match_id && selectedSurebet?.market_type === sb.market_type;
+                      return (
+                        <div 
+                          key={sb.id}
+                          className={`surebet-card ${isSelected ? 'selected' : ''}`}
+                          style={{ borderStyle: 'dashed', opacity: isSelected ? 1 : 0.75 }}
+                          onClick={() => setSelectedSurebet(sb)}
+                        >
+                          <div className="card-top">
+                            <span className="league-badge" style={{ fontSize: '0.65rem', padding: '0.1rem 0.3rem' }}>{sb.market_type}</span>
+                            <span className="roi-badge" style={{ fontSize: '0.75rem' }}>+{sb.roi}% ROI</span>
+                          </div>
+                          <div style={{ fontSize: '0.8rem', fontWeight: 600, margin: '0.25rem 0' }}>
+                            {getTeamsFromMatchId(sb.match_id)}
+                          </div>
+                          <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                            Detectado: {new Date(sb.timestamp * 1000).toLocaleTimeString()}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Right Side: Interactive Stake Calculator */}
@@ -833,6 +945,11 @@ export default function App() {
                     <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
                       {selectedSurebet.league} • Minuto {selectedSurebet.minute}' • Marcador {selectedSurebet.score} {selectedSurebet.market_type ? `• ${selectedSurebet.market_type}` : ''}
                     </p>
+                    {!surebets.some((sb) => sb.match_id === selectedSurebet.match_id && sb.market_type === selectedSurebet.market_type) && (
+                      <div className="warn-badge" style={{ marginTop: '0.35rem' }}>
+                        ⚠️ Inactivo (Histórico)
+                      </div>
+                    )}
                   </div>
 
                   {/* Budget Input */}
@@ -1260,6 +1377,102 @@ export default function App() {
               )}
             </div>
           </>
+        ) : activeTab === 'suggestions' ? (
+          <div className="suggestions-grid">
+            <div className="list-section-header">
+              <div>
+                <h2>Predicciones y Sugerencias de Partidos (H2H Histórico)</h2>
+                <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
+                  Análisis estadístico basado en el historial completo de encuentros previos (H2H) para partidos programados.
+                </p>
+              </div>
+              <button className="tab-btn" onClick={fetchSuggestions} style={{ padding: '0.35rem 0.75rem', backgroundColor: 'var(--bg-tertiary)' }}>
+                {loadingSuggestions ? 'Analizando...' : 'Refrescar'}
+              </button>
+            </div>
+
+            {suggestions.length === 0 ? (
+              <div className="empty-state">
+                <AlertCircle className="empty-icon" size={48} />
+                <div>
+                  <p style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: '0.25rem' }}>No hay partidos programados</p>
+                  <p style={{ fontSize: '0.85rem' }}>Todos los partidos del fixture se están jugando en vivo actualmente.</p>
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {suggestions.map((sug) => {
+                  const startTime = new Date(sug.start_time * 1000);
+                  const timeStr = startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                  const dateStr = startTime.toLocaleDateString([], { day: '2-digit', month: '2-digit' });
+                  const timeDiffMins = Math.round((sug.start_time - Date.now() / 1000) / 60);
+                  const relativeTime = timeDiffMins <= 0 ? "Comenzando..." : `En ${timeDiffMins} min`;
+                  
+                  const homeWins = sug.h2h_stats.home_wins;
+                  const awayWins = sug.h2h_stats.away_wins;
+                  const draws = sug.h2h_stats.draws;
+                  const totalH2h = sug.h2h_stats.total_matches;
+                  
+                  const pctHome = totalH2h > 0 ? (homeWins / totalH2h) * 100 : 33.3;
+                  const pctDraw = totalH2h > 0 ? (draws / totalH2h) * 100 : 33.3;
+                  const pctAway = totalH2h > 0 ? (awayWins / totalH2h) * 100 : 33.3;
+
+                  return (
+                    <div key={sug.match_id} className="suggestions-card">
+                      <div className="suggestions-header">
+                        <span className="suggestions-match-title">
+                          {sug.home_team} vs {sug.away_team}
+                        </span>
+                        <div className="suggestions-time">
+                          <Clock size={14} />
+                          <span>{dateStr} {timeStr} ({relativeTime})</span>
+                        </div>
+                      </div>
+                      
+                      <div className="suggestions-content">
+                        <div className="h2h-stats-panel">
+                          <h4 className="h2h-title">Historial Frente a Frente (H2H)</h4>
+                          <div className="h2h-record-row">
+                            <span>Historial: {totalH2h} encuentros</span>
+                            <span>{homeWins} L - {draws} E - {awayWins} V</span>
+                          </div>
+                          
+                          <div className="h2h-record-bar">
+                            <div className="h2h-bar-segment win" style={{ width: `${pctHome}%` }} title={`Local: ${homeWins}`}></div>
+                            <div className="h2h-bar-segment draw" style={{ width: `${pctDraw}%` }} title={`Empate: ${draws}`}></div>
+                            <div className="h2h-bar-segment loss" style={{ width: `${pctAway}%` }} title={`Visitante: ${awayWins}`}></div>
+                          </div>
+                          
+                          <div className="h2h-details-row">
+                            <span>Promedio Goles: {sug.h2h_stats.avg_goals} g/partido</span>
+                            <span>Over 2.5 Goles: {sug.h2h_stats.over_2_5_pct}%</span>
+                          </div>
+                        </div>
+
+                        <div className="recommendations-panel">
+                          <div className="rec-item">
+                            <span className="rec-label">Sugerencia de Resultado:</span>
+                            <div className={`rec-badge ${sug.suggestions.winner_confidence >= 60 ? 'gold' : ''}`}>
+                              <span>{sug.suggestions.winner}</span>
+                              <span className="rec-confidence">({sug.suggestions.winner_confidence}%)</span>
+                            </div>
+                          </div>
+                          
+                          <div className="rec-item">
+                            <span className="rec-label">Sugerencia de Goles:</span>
+                            <div className="rec-badge">
+                              <span>{sug.suggestions.goals}</span>
+                              <span className="rec-confidence">({sug.suggestions.goals_confidence}%)</span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         ) : (
           <div className="ledger-view">
             {/* SVG Chart of Cumulative Profit */}
